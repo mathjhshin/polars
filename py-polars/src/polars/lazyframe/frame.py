@@ -120,6 +120,7 @@ if TYPE_CHECKING:
     import polars.io.iceberg
     from polars.io.partition import PartitionBy, SinkedPathsCallback
     from polars.lazyframe.opt_flags import QueryOptFlags
+    from polars.lazyframe.opt_template import OptimizedTemplate
 
     with contextlib.suppress(ImportError):  # Module not available when building docs
         from polars._plr import PyExpr, PySelector
@@ -485,6 +486,86 @@ class LazyFrame:
                 schema, scan_fn, validate_schema=validate_schema, is_pure=is_pure
             )
         return self
+
+    def bind(
+        self,
+        bindings: dict[str, LazyFrame],
+    ) -> LazyFrame:
+        """
+        Bind placeholder scan nodes to concrete LazyFrames.
+
+        Replaces all ``PlaceholderScan`` nodes in the plan tree with the
+        corresponding LazyFrame's plan from the bindings map.
+        This must be called before :meth:`collect`.
+
+        Parameters
+        ----------
+        bindings
+            A dictionary mapping placeholder names to concrete LazyFrames.
+
+        Returns
+        -------
+        LazyFrame
+            A new LazyFrame with all placeholders replaced.
+
+        See Also
+        --------
+        scan_placeholder : Create a placeholder LazyFrame.
+        optimize_template : Optimize the template for repeated use.
+
+        Examples
+        --------
+        >>> template = pl.scan_placeholder(
+        ...     "input",
+        ...     {"a": pl.Int64, "b": pl.String},
+        ... ).filter(pl.col("a") > 0)
+        >>> df = pl.DataFrame({"a": [1, -2, 3], "b": ["x", "y", "z"]})
+        >>> result = template.bind({"input": df.lazy()}).collect()
+        """
+        rust_bindings = {k: v._ldf for k, v in bindings.items()}
+        result_ldf = self._ldf.bind(rust_bindings)
+        return self._from_pyldf(result_ldf)
+
+    def optimize_template(self) -> OptimizedTemplate:
+        """
+        Optimize this LazyFrame into a reusable :class:`OptimizedTemplate`.
+
+        The LazyFrame must contain at least one ``PlaceholderScan`` node
+        (created via :func:`scan_placeholder`). The plan is optimized once.
+        The returned template can be bound to different data repeatedly
+        without re-running optimization.
+
+        .. warning::
+            This method is designed for **in-memory data sources**. When binding
+            file-based scans (e.g., ``scan_parquet``, ``scan_csv``), scan-level
+            optimizations such as predicate pushdown into the reader, Hive
+            partition pruning, and slice pushdown are skipped because the plan
+            is already optimized before the concrete source is known. For
+            file-based sources, use :meth:`bind` + :meth:`collect` instead.
+
+        Returns
+        -------
+        OptimizedTemplate
+            A pre-optimized template that can be bound to different data.
+
+        See Also
+        --------
+        scan_placeholder : Create a placeholder LazyFrame.
+        bind : Bind placeholders at the DSL level (re-optimizes every time).
+
+        Examples
+        --------
+        >>> template_lf = pl.scan_placeholder(
+        ...     "input",
+        ...     {"a": pl.Int64, "b": pl.String},
+        ... ).filter(pl.col("a") > 0)
+        >>> template = template_lf.optimize_template()
+        >>> df = pl.DataFrame({"a": [1, -2, 3], "b": ["x", "y", "z"]})
+        >>> result = template.bind_and_collect({"input": df.lazy()})
+        """
+        from polars.lazyframe.opt_template import OptimizedTemplate
+
+        return OptimizedTemplate._from_pyot(self._ldf.optimize_template())
 
     @classmethod
     def deserialize(

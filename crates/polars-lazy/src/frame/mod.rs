@@ -4,6 +4,8 @@ mod python;
 
 mod cached_arenas;
 mod err;
+mod optimized_template;
+pub use optimized_template::OptimizedTemplate;
 #[cfg(not(target_arch = "wasm32"))]
 mod exitable;
 
@@ -110,6 +112,81 @@ impl LazyFrame {
             opt_state,
             cached_arena: Default::default(),
         }
+    }
+
+    /// Create a placeholder LazyFrame with a given name and schema.
+    ///
+    /// This creates a reusable computation graph template. The placeholder must be
+    /// bound to a concrete data source via [`bind`](Self::bind) before collecting.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// use polars::prelude::*;
+    /// use std::collections::HashMap;
+    ///
+    /// // Create a template with placeholders
+    /// let schema = Schema::from_iter([
+    ///     Field::new("a".into(), DataType::Int64),
+    ///     Field::new("b".into(), DataType::String),
+    /// ]);
+    /// let template = LazyFrame::placeholder("input", schema)
+    ///     .filter(col("a").gt(lit(0)))
+    ///     .select([col("a"), col("b")]);
+    ///
+    /// // Bind concrete data and collect
+    /// let df = DataFrame::new(vec![
+    ///     Column::new("a".into(), &[1i64, -2, 3]),
+    ///     Column::new("b".into(), &["x", "y", "z"]),
+    /// ]).unwrap();
+    /// let mut bindings = HashMap::new();
+    /// bindings.insert("input".into(), df.lazy());
+    /// let result = template.bind(bindings).unwrap().collect().unwrap();
+    /// ```
+    pub fn placeholder(name: impl Into<PlSmallStr>, schema: Schema) -> Self {
+        let plan = DslPlan::PlaceholderScan {
+            name: name.into(),
+            schema: Arc::new(schema),
+        };
+        LazyFrame {
+            logical_plan: plan,
+            opt_state: Default::default(),
+            cached_arena: Default::default(),
+        }
+    }
+
+    /// Bind placeholder scan nodes to concrete LazyFrames.
+    ///
+    /// Replaces all `PlaceholderScan` nodes in the plan tree with the corresponding
+    /// LazyFrame's plan from the bindings map. This must be called before `collect()`.
+    ///
+    /// Returns an error if any PlaceholderScan node has no corresponding binding.
+    pub fn bind(self, bindings: PlHashMap<PlSmallStr, LazyFrame>) -> PolarsResult<Self> {
+        let plan_bindings: PlHashMap<PlSmallStr, DslPlan> = bindings
+            .into_iter()
+            .map(|(k, v)| (k, v.logical_plan))
+            .collect();
+        let new_plan = self.logical_plan.bind(&plan_bindings)?;
+        Ok(LazyFrame {
+            logical_plan: new_plan,
+            opt_state: self.opt_state,
+            cached_arena: Default::default(),
+        })
+    }
+
+    /// Optimize this LazyFrame into a reusable [`OptimizedTemplate`].
+    ///
+    /// The LazyFrame must contain at least one `PlaceholderScan` node. The plan is
+    /// optimized once at creation time. The returned template can be bound to different
+    /// concrete data sources repeatedly without re-running optimization.
+    ///
+    /// **Note:** Designed for in-memory data sources. When binding file-based scans
+    /// (e.g., Parquet, CSV), scan-level optimizations (predicate pushdown into readers,
+    /// Hive partition pruning, slice pushdown) are skipped because the plan is already
+    /// optimized before the concrete source is known. For file-based sources, prefer
+    /// [`LazyFrame::bind`] + `collect()` instead.
+    pub fn optimize_template(self) -> PolarsResult<OptimizedTemplate> {
+        let ir_plan = self.to_alp_optimized()?;
+        OptimizedTemplate::new(ir_plan)
     }
 
     /// Get current optimizations.
